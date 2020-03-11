@@ -51,29 +51,27 @@ configure() (
     --enable-gpl                    \
     --enable-version3               \
     --enable-w32threads             \
-    --disable-demuxer=matroska      \
     --disable-filters               \
-    --enable-filter=scale,yadif,w3fdif \
+    --enable-filter=scale,scale_cuda,yadif,yadif_cuda,w3fdif,crop,tonemap,tonemap_opencl,zscale,hwupload,hwdownload,hwupload_cuda \
     --disable-protocol=async,cache,concat,httpproxy,icecast,md5,subfile \
-    --disable-muxers                \
     --enable-muxer=spdif            \
     --disable-bsfs                  \
     --enable-bsf=extract_extradata,vp9_superframe_split \
-    --disable-cuda                  \
-    --disable-cuvid                 \
-    --disable-nvenc                 \
+    --enable-cuda                   \
+    --enable-opencl                 \
+    --enable-cuvid                  \
+    --enable-nvenc                  \
     --enable-libdav1d               \
     --enable-libspeex               \
     --enable-libopencore-amrnb      \
     --enable-libopencore-amrwb      \
     --enable-avresample             \
     --enable-avisynth               \
+    --enable-libzimg                \
     --disable-avdevice              \
     --disable-postproc              \
     --disable-swresample            \
-    --disable-encoders              \
     --disable-devices               \
-    --disable-programs              \
     --disable-debug                 \
     --disable-doc                   \
     --disable-schannel              \
@@ -86,18 +84,14 @@ configure() (
   EXTRA_LDFLAGS=""
   PKG_CONFIG_PREFIX_DIR=""
   if [ "${arch}" == "x86_64" ]; then
-    export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:../thirdparty/64/lib/pkgconfig/"
-    OPTIONS="${OPTIONS} --enable-cross-compile --cross-prefix=${cross_prefix} --target-os=mingw32 --pkg-config=pkg-config"
-    EXTRA_CFLAGS="${EXTRA_CFLAGS} -I../thirdparty/64/include"
-    EXTRA_LDFLAGS="${EXTRA_LDFLAGS} -L../thirdparty/64/lib"
-    PKG_CONFIG_PREFIX_DIR="--define-variable=prefix=../thirdparty/64"
+    EXTRA_CFLAGS="${EXTRA_CFLAGS} -I/opt/cuda/include"
+    EXTRA_LDFLAGS="${EXTRA_LDFLAGS} -L/opt/cuda/lib/x64"
   else
-    export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:../thirdparty/32/lib/pkgconfig/"
     OPTIONS="${OPTIONS} --cpu=i686"
-    EXTRA_CFLAGS="${EXTRA_CFLAGS} -I../thirdparty/32/include -mmmx -msse -msse2 -mfpmath=sse -mstackrealign"
-    EXTRA_LDFLAGS="${EXTRA_LDFLAGS} -L../thirdparty/32/lib"
-    PKG_CONFIG_PREFIX_DIR="--define-variable=prefix=../thirdparty/32"
-  fi
+    EXTRA_CFLAGS="${EXTRA_CFLAGS} -mmmx -msse -msse2 -mfpmath=sse -mstackrealign"
+    EXTRA_CFLAGS="${EXTRA_CFLAGS} -I/opt/cuda/include"
+    EXTRA_LDFLAGS="${EXTRA_LDFLAGS} -L/opt/cuda/lib/Win32"
+    fi
 
   sh configure --extra-ldflags="${EXTRA_LDFLAGS}" --extra-cflags="${EXTRA_CFLAGS}" --pkg-config-flags="--static ${PKG_CONFIG_PREFIX_DIR}" ${OPTIONS}
 )

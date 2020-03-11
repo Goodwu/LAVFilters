@@ -1675,7 +1675,6 @@ STDMETHODIMP CLAVVideo::Deliver(LAVFrame *pFrame)
   // Only perform filtering if we have to.
   // DXVA Native generally can't be filtered, and the only filtering we currently support is software deinterlacing
   if ( pFrame->format == LAVPixFmt_DXVA2 || pFrame->format == LAVPixFmt_D3D11
-    || !(m_Decoder.IsInterlaced(FALSE) && m_settings.SWDeintMode != SWDeintMode_None)
     || pFrame->flags & LAV_FRAME_FLAG_REDRAW) {
     return DeliverToRenderer(pFrame);
   } else {

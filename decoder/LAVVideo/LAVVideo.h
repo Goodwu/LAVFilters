@@ -241,7 +241,12 @@ private:
   HRESULT RedrawStillImage();
   HRESULT SetInDVDMenu(bool menu) { m_bInDVDMenu = menu; return S_OK; }
 
-private:
+  BOOL ShouldDeint(LAVFrame *pFrame);
+  BOOL ShouldScale();
+  BOOL ShouldTonemap(LAVFrame *pFrame);
+  BOOL HWPostProc();
+
+ private:
   friend class CVideoInputPin;
   friend class CVideoOutputPin;
   friend class CDecodeManager;
@@ -279,6 +284,7 @@ private:
   int                  m_filterWidth           = 0;
   int                  m_filterHeight          = 0;
   LAVFrame             m_FilterPrevFrame;
+  int                  m_scaleTarget           = 1280;
 
   BOOL                 m_LAVPinInfoValid       = FALSE;
   LAVPinInfo           m_LAVPinInfo;
@@ -299,6 +305,8 @@ private:
   AM_SimpleRateChange  m_DVDRate = AM_SimpleRateChange{AV_NOPTS_VALUE, 10000};
 
   BOOL                 m_bRuntimeConfig = FALSE;
+
+  BOOL                 m_bFilterNeeded = TRUE;
   struct VideoSettings {
     BOOL TrayIcon;
     DWORD StreamAR;
