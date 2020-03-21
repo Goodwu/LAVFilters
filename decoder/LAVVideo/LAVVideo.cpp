@@ -81,10 +81,13 @@ CLAVVideo::~CLAVVideo()
   ReleaseLastSequenceFrame();
   m_Decoder.Close();
 
+  /*
   if (m_pFilterGraph)
     avfilter_graph_free(&m_pFilterGraph);
   m_pFilterBufferSrc = nullptr;
   m_pFilterBufferSink = nullptr;
+  */
+  ProcThreadDeInitAll();
 
   if (m_SubtitleConsumer)
     m_SubtitleConsumer->DisconnectProvider();
@@ -900,9 +903,11 @@ HRESULT CLAVVideo::PerformFlush()
   m_Decoder.Flush();
 
   m_bInDVDMenu = FALSE;
-
+  /*
   if (m_pFilterGraph)
     avfilter_graph_free(&m_pFilterGraph);
+    */
+  ProcThreadDeInitAll();
 
   m_rtPrevStart = m_rtPrevStop = 0;
   memset(&m_FilterPrevFrame, 0, sizeof(m_FilterPrevFrame));
@@ -955,8 +960,11 @@ HRESULT CLAVVideo::BreakConnect(PIN_DIRECTION dir)
 {
   DbgLog((LOG_TRACE, 10, L"::BreakConnect"));
   if (dir == PINDIR_INPUT) {
+      /*
     if (m_pFilterGraph)
       avfilter_graph_free(&m_pFilterGraph);
+      */
+    ProcThreadDeInitAll();
 
     m_Decoder.Close();
     m_X264Build = -1;

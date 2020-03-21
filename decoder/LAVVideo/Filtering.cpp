@@ -230,20 +230,23 @@ void fillExtProperties(AVFrame *out_frame, LAVFrame *frame)
   return;
 }
 
-BOOL CLAVVideo::ShouldDeint(LAVFrame *pFrame) {
+BOOL CLAVVideo::ShouldDeint(LAVFrame *pFrame)
+{
   BOOL bFlush = pFrame->flags & LAV_FRAME_FLAG_FLUSH;
-  if (m_Decoder.IsInterlaced(FALSE) && m_settings.DeintMode != DeintMode_Disable && (m_settings.SWDeintMode == SWDeintMode_YADIF || m_settings.SWDeintMode == SWDeintMode_W3FDIF_Simple || m_settings.SWDeintMode == SWDeintMode_W3FDIF_Complex) && ((bFlush && m_pFilterGraph) || pFrame->format == LAVPixFmt_YUV420 || pFrame->format == LAVPixFmt_YUV422 || pFrame->format == LAVPixFmt_NV12)) {
+  if (m_Decoder.IsInterlaced(FALSE) && m_settings.DeintMode != DeintMode_Disable && (m_settings.SWDeintMode == SWDeintMode_YADIF || m_settings.SWDeintMode == SWDeintMode_W3FDIF_Simple || m_settings.SWDeintMode == SWDeintMode_W3FDIF_Complex) && (pFrame->format == LAVPixFmt_YUV420 || pFrame->format == LAVPixFmt_YUV422 || pFrame->format == LAVPixFmt_NV12)) {
     return true;
   } else {
     return false;
   }
 }
 
-BOOL CLAVVideo::ShouldScale() {
+BOOL CLAVVideo::ShouldScale()
+{
   return true;
 }
 
-BOOL CLAVVideo::ShouldTonemap(LAVFrame *pFrame) {
+BOOL CLAVVideo::ShouldTonemap(LAVFrame *pFrame)
+{
   DbgLog((LOG_TRACE, 10, L"format:%d", pFrame->format));
   //PrintExtFmt(pFrame->ext_format);
   if (/*switch here && */ pFrame->format == LAVPixFmt_P016 || pFrame->ext_format.VideoTransferFunction == 15) {
@@ -260,7 +263,8 @@ BOOL CLAVVideo::HWPostProc()
 }
 
 #define LOG_BUF_LEN 2048
-inline void lavv_log_callback(void *ptr, int level, const char *fmt, va_list vl) {
+inline void lavv_log_callback(void *ptr, int level, const char *fmt, va_list vl)
+{
   static char line[LOG_BUF_LEN] = {0};
 
   _vsnprintf_s(line, sizeof(line), fmt, vl);
@@ -271,32 +275,250 @@ inline void lavv_log_callback(void *ptr, int level, const char *fmt, va_list vl)
   DbgLog((LOG_TRACE, 10, L"%S", line));
 }
 
-HRESULT CLAVVideo::Filter(LAVFrame *pFrame) {
+void ProcThread::Run()
+{
+  int ret;
+  while (m_bRun) {
+    DbgLog((LOG_TRACE, 10, L"[%d]Kickoff wait in Run", m_iIdx));
+    std::unique_lock<std::mutex> lck(kickoff);
+    kickoff_cv.wait(lck);
+    DbgLog((LOG_TRACE, 10, L"[%d]Kickoff wait done in Run", m_iIdx));
+    if (!m_bRun)
+      break;
+    FrameInfo *info = m_pFrameInfo;
+    AVFrame *in_frame = info->in_frame;
+
+    if ((ret = av_buffersrc_write_frame(m_pFilterBufferSrc, in_frame)) < 0) {
+      av_frame_free(&in_frame);
+      SAFE_CO_FREE(info);
+      continue;
+    }
+
+    BOOL bFramePerField = info->bFramePerField;
+
+    AVFrame *out_frame = av_frame_alloc();
+    //info->pFilterBufferSink = m_pFilterBufferSink;
+    info->time_num = m_pFilterBufferSink->inputs[0]->time_base.num;
+    info->time_den = m_pFilterBufferSink->inputs[0]->time_base.den;
+
+    for (int i = 0; i < FRAMES_IN_THREAD; i++) {
+      if ((av_buffersink_get_frame(m_pFilterBufferSink, out_frame) >= 0)) {
+          DbgLog((LOG_TRACE, 10, L"[%d]Got one result", m_iIdx));
+          info->out_frames[i] = out_frame;
+#ifndef FILTER_PROC_MULTI_THREAD
+        hrDeliver = m_pClav->DeliverFrame(info);
+#endif
+      }
+      else {
+          DbgLog((LOG_TRACE, 10, L"[%d]No result", m_iIdx));
+          info->out_frames[i] = NULL;
+        break;
+      }
+    }
+
+    info->in_frame = NULL;
+
+    //av_frame_free(&in_frame);
+    //m_pFrameInfo = NULL;
+    //DbgLog((LOG_TRACE, 10, L"[%d]Kickoff lock in Run end", m_iIdx));
+    //kickoff.lock();
+    DbgLog((LOG_TRACE, 10, L"[%d]Process complete", m_iIdx));
+    //DbgLog((LOG_TRACE, 10, L"[%d]Set thread idle", m_iIdx));
+    //running.unlock();
+#ifndef FILTER_PROC_MULTI_THREAD
+    break;
+#endif
+  }
+}
+
+int ProcThread::Init(int i, CLAVVideo* pClav, AVPixelFormat* pix_fmts, char* strFilterInit, char* strFilterConfig, BOOL bIsHardware) {
+    int ret;
+    if (m_pFilterGraph) {
+        avfilter_graph_free(&m_pFilterGraph);
+        m_pFilterBufferSrc = nullptr;
+        m_pFilterBufferSink = nullptr;
+    }
+    m_pClav = pClav;
+    m_iIdx = i;
+
+    const AVFilter* buffersrc = avfilter_get_by_name("buffer");
+    const AVFilter* buffersink = avfilter_get_by_name("buffersink");
+    AVFilterInOut* outputs = avfilter_inout_alloc();
+    AVFilterInOut* inputs = avfilter_inout_alloc();
+
+    m_pFilterGraph = avfilter_graph_alloc();
+
+    av_opt_set(m_pFilterGraph, "thread_type", "slice", AV_OPT_SEARCH_CHILDREN);
+    av_opt_set_int(m_pFilterGraph, "threads", FFMAX(1, av_cpu_count() / 2), AV_OPT_SEARCH_CHILDREN);
+
+    ret = avfilter_graph_create_filter(&m_pFilterBufferSrc, buffersrc, "in", strFilterInit, nullptr, m_pFilterGraph);
+    if (ret < 0) {
+        DbgLog((LOG_TRACE, 10, L"::Filter()(init) Creating the input buffer filter failed with code %d", ret));
+        avfilter_graph_free(&m_pFilterGraph);
+        m_pFilterGraph = NULL;
+        return ret;
+    }
+
+    ret = avfilter_graph_create_filter(&m_pFilterBufferSink, buffersink, "out", nullptr, nullptr, m_pFilterGraph);
+    if (ret < 0) {
+        DbgLog((LOG_TRACE, 10, L"::Filter()(init) Creating the buffer sink filter failed with code %d", ret));
+        avfilter_free(m_pFilterBufferSrc);
+        m_pFilterBufferSrc = nullptr;
+        avfilter_graph_free(&m_pFilterGraph);
+        m_pFilterGraph = NULL;
+        return ret;
+    }
+
+    /* set allowed pixfmts on the output */
+    av_opt_set_int_list(m_pFilterBufferSink->priv, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, 0);
+
+    /* Endpoints for the filter graph. */
+    outputs->name = av_strdup("in");
+    outputs->filter_ctx = m_pFilterBufferSrc;
+    outputs->pad_idx = 0;
+    outputs->next = nullptr;
+
+    inputs->name = av_strdup("out");
+    inputs->filter_ctx = m_pFilterBufferSink;
+    inputs->pad_idx = 0;
+    inputs->next = nullptr;
+
+    if ((ret = avfilter_graph_parse_ptr(m_pFilterGraph, strFilterConfig, &inputs, &outputs, nullptr)) < 0) {
+        DbgLog((LOG_TRACE, 10, L"::Filter()(init) Parsing the graph failed with code %d", ret));
+        avfilter_graph_free(&m_pFilterGraph);
+        m_pFilterGraph = NULL;
+        return ret;
+    }
+
+    //init hardware
+    if (bIsHardware) {
+        //TODO: Check if device will be freed in avfilter_graph_free
+        AVBufferRef* device;
+        ret = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_OPENCL, NULL, NULL, 0);
+        if (ret < 0)
+            return ret;
+        for (unsigned int i = 0; i < m_pFilterGraph->nb_filters; i++) {
+            m_pFilterGraph->filters[i]->hw_device_ctx = av_buffer_ref(device);
+            if (!m_pFilterGraph->filters[i]->hw_device_ctx) {
+              av_buffer_unref(&device);
+              avfilter_graph_free(&m_pFilterGraph);
+              m_pFilterGraph = NULL;
+              ret = AVERROR(ENOMEM);
+              return ret;
+            }
+        }
+        //TODO: Check if here is needed
+        //av_buffer_unref(&device);
+    }
+
+    if ((ret = avfilter_graph_config(m_pFilterGraph, nullptr)) < 0) {
+        DbgLog((LOG_TRACE, 10, L"::Filter()(init) Configuring the graph failed with code %d", ret));
+        avfilter_graph_free(&m_pFilterGraph);
+        m_pFilterGraph = NULL;
+        return ret;
+    }
+
+    Start();
+
+    Inited = TRUE;
+
+    return 0;
+}
+
+int CLAVVideo::FeedFilter(FrameInfo *in) {
+  //Get a idle thread
+  for (int j=0; j < 5;j++) {
+    for (int i=0; i < FILTER_PROC_THREADS; i++) {
+      if (m_procThread[i].Get()) {
+        DbgLog((LOG_TRACE, 10, L"[%d]Got thread", i));
+        m_procThread[i].SetFrame(in);
+        Q.push(&m_procThread[i]);
+        goto end;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+end:
+#ifdef FILTER_PROC_MULTI_THREAD
+#else
+  Run();
+#endif
+
+  return 0;
+}
+
+void CLAVVideo::DeliverFrame(FrameInfo *info) {
+  for (int j = 0; info->out_frames[j]; j++) {
+    LAVFrame *outFrame = nullptr;
+    AVFrame *out_frame = info->out_frames[j];
+    AllocateFrame(&outFrame);
+
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get((AVPixelFormat)out_frame->format);
+    // Copy most settings over
+    outFrame->format = ConvertFormat((AVPixelFormat)out_frame->format);
+    outFrame->bpp = av_get_bits_per_pixel(desc);
+    fillDXVAExtFormat(outFrame->ext_format, out_frame->color_range - 1, out_frame->color_primaries, out_frame->colorspace, out_frame->color_trc, out_frame->chroma_location, false);
+    if (outFrame->ext_format.VideoTransferFunction == DXVA2_VideoTransFunc_709) {
+      outFrame->ext_format.VideoPrimaries = DXVA2_VideoPrimaries_BT709;
+      outFrame->ext_format.VideoTransferMatrix = DXVA2_VideoTransferMatrix_BT709;
+    }
+    outFrame->avgFrameDuration = info->avgFrameDuration;
+    outFrame->flags = info->flags;
+
+    outFrame->width = out_frame->width;
+    outFrame->height = out_frame->height;
+    outFrame->aspect_ratio = out_frame->sample_aspect_ratio;
+    outFrame->tff = out_frame->top_field_first;
+
+    REFERENCE_TIME pts = av_rescale(out_frame->pts, info->time_num * 10000000LL, info->time_den);
+    outFrame->rtStart = pts;
+    outFrame->rtStop = pts + info->rtDuration;
+
+    for (int i = 0; i < 4; i++) {
+      outFrame->data[i] = out_frame->data[i];
+      outFrame->stride[i] = out_frame->linesize[i];
+    }
+
+    outFrame->destruct = avfilter_free_lav_buffer;
+    outFrame->priv_data = av_frame_alloc();
+    av_frame_move_ref((AVFrame *)outFrame->priv_data, out_frame);
+
+    deliver.lock();
+    DeliverToRenderer(outFrame);
+    deliver.unlock();
+    av_frame_free(&out_frame);
+  }
+  av_frame_free(&info->in_frame);
+  SAFE_CO_FREE(info);
+
+  return;
+}
+
+HRESULT CLAVVideo::Filter(LAVFrame *pFrame)
+{
   int ret = 0;
   BOOL bFlush = pFrame->flags & LAV_FRAME_FLAG_FLUSH;
   if (pFrame->ext_format.VideoTransferFunction == 15) {
     pFrame->format = LAVPixFmt_P016;
   }
-  av_log_set_callback(&lavv_log_callback);
+  //av_log_set_callback(&lavv_log_callback);
 
   SYSTEMTIME t1, t2;
   GetSystemTime(&t1);
 
   if (ShouldDeint(pFrame) || ShouldScale() || ShouldTonemap(pFrame)) {
     AVPixelFormat ff_pixfmt = ConvertFormat(pFrame->format);
-    if (!bFlush && (!m_pFilterGraph || pFrame->format != m_filterPixFmt || pFrame->width != m_filterWidth || pFrame->height != m_filterHeight)) {
+    if (!bFlush && (!m_procThread[0].Inited || pFrame->format != m_filterPixFmt || pFrame->width != m_filterWidth || pFrame->height != m_filterHeight)) {
       DbgLog((LOG_TRACE, 10, L":Filter()(init) Initializing post process filter for %S", av_get_pix_fmt_name(ff_pixfmt)));
-      if (m_pFilterGraph) {
-        avfilter_graph_free(&m_pFilterGraph);
-        m_pFilterBufferSrc = nullptr;
-        m_pFilterBufferSink = nullptr;
-      }
+      //TODO: deinit all m_pFilterGraphs
+      ProcThreadDeInitAll();
 
       m_filterPixFmt = pFrame->format;
       m_filterWidth  = pFrame->width;
       m_filterHeight = pFrame->height;
 
-      char args[512];
+      char args_init[512], args_config[512];
       enum AVPixelFormat pix_fmts[4];
 
       if (ff_pixfmt == AV_PIX_FMT_NV12) {
@@ -310,54 +532,15 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame) {
         pix_fmts[3] = AV_PIX_FMT_NONE;
       }
 
-      const AVFilter *buffersrc  = avfilter_get_by_name("buffer");
-      const AVFilter *buffersink = avfilter_get_by_name("buffersink");
-      AVFilterInOut *outputs = avfilter_inout_alloc();
-      AVFilterInOut *inputs  = avfilter_inout_alloc();
-
-      m_pFilterGraph = avfilter_graph_alloc();
-
-      av_opt_set(m_pFilterGraph, "thread_type", "slice", AV_OPT_SEARCH_CHILDREN);
-      av_opt_set_int(m_pFilterGraph, "threads", FFMAX(1, av_cpu_count() / 2), AV_OPT_SEARCH_CHILDREN);
-
       // 0/0 is not a valid value for avfilter, make sure it doesn't happen
       AVRational aspect_ratio = pFrame->aspect_ratio;
       if (aspect_ratio.num == 0 || aspect_ratio.den == 0)
         aspect_ratio = { 0, 1 };
 
-      _snprintf_s(args, sizeof(args), "video_size=%dx%d:pix_fmt=%s:time_base=1/10000000:pixel_aspect=%d/%d", pFrame->width, pFrame->height, av_get_pix_fmt_name(ff_pixfmt), pFrame->aspect_ratio.num, pFrame->aspect_ratio.den);
-      ret = avfilter_graph_create_filter(&m_pFilterBufferSrc, buffersrc, "in", args, nullptr, m_pFilterGraph);
-      if (ret < 0) {
-        DbgLog((LOG_TRACE, 10, L"::Filter()(init) Creating the input buffer filter failed with code %d", ret));
-        avfilter_graph_free(&m_pFilterGraph);
-        goto deliver;
-      }
+      _snprintf_s(args_init, sizeof(args_init), "video_size=%dx%d:pix_fmt=%s:time_base=1/10000000:pixel_aspect=%d/%d", pFrame->width, pFrame->height, av_get_pix_fmt_name(ff_pixfmt), pFrame->aspect_ratio.num, pFrame->aspect_ratio.den);
 
-      ret = avfilter_graph_create_filter(&m_pFilterBufferSink, buffersink, "out", nullptr, nullptr, m_pFilterGraph);
-      if (ret < 0) {
-        DbgLog((LOG_TRACE, 10, L"::Filter()(init) Creating the buffer sink filter failed with code %d", ret));
-        avfilter_free(m_pFilterBufferSrc);
-        m_pFilterBufferSrc = nullptr;
-        avfilter_graph_free(&m_pFilterGraph);
-        goto deliver;
-      }
-
-      /* set allowed pixfmts on the output */
-      av_opt_set_int_list(m_pFilterBufferSink->priv, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, 0);
-
-      /* Endpoints for the filter graph. */
-      outputs->name       = av_strdup("in");
-      outputs->filter_ctx = m_pFilterBufferSrc;
-      outputs->pad_idx    = 0;
-      outputs->next       = nullptr;
-
-      inputs->name       = av_strdup("out");
-      inputs->filter_ctx = m_pFilterBufferSink;
-      inputs->pad_idx    = 0;
-      inputs->next       = nullptr;
-
-      args[0] = 0;
       if(HWPostProc()) {
+        args_config[0] = 0;
         /*
         if (ShouldDeint(pFrame)) {
           if (m_settings.SWDeintMode == SWDeintMode_YADIF)
@@ -371,26 +554,26 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame) {
         }*/
         if (pFrame->width > m_scaleTarget &&ShouldScale()) {
           char scale_str[128];
-          
-          if (strlen(args))
-            strcat_s(args, ",");
+
+          if (strlen(args_config))
+            strcat_s(args_config, ",");
           else
-            strcat_s(args, "hwupload_cuda,");
+            strcat_s(args_config, "hwupload_cuda,");
           _snprintf_s(scale_str, sizeof(scale_str), "scale_cuda=%d:-1,format=cuda", m_scaleTarget);
-          strcat_s(args, scale_str);
+          strcat_s(args_config, scale_str);
         }
         if (ShouldTonemap(pFrame)) {
-          if (strlen(args))
-            strcat_s(args, ",hwdownload,format=p010le,hwupload,");
+          if (strlen(args_config))
+            strcat_s(args_config, ",hwdownload,format=p010le,hwupload,");
           else
-            strcat_s(args, "hwupload,");
-          strcat_s(args, "tonemap_opencl=t=bt2020:tonemap=hable:desat=0:format=nv12");
+            strcat_s(args_config, "hwupload,");
+          strcat_s(args_config, "tonemap_opencl=t=bt2020:tonemap=hable:desat=0:format=nv12");
         }
-        if (strlen(args)) {
+        if (strlen(args_config)) {
           if (!ShouldTonemap(pFrame) && pFrame->format == LAVPixFmt_P016) {
-            strcat_s(args, ",hwdownload,format=p010le");
+            strcat_s(args_config, ",hwdownload,format=p010le");
           } else {
-            strcat_s(args, ",hwdownload,format=nv12");
+            strcat_s(args_config, ",hwdownload,format=nv12");
           }
         }
 
@@ -399,70 +582,40 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame) {
       } else {
         if (ShouldDeint(pFrame)) {
           if (m_settings.SWDeintMode == SWDeintMode_YADIF)
-            _snprintf_s(args, sizeof(args), "yadif=mode=%s:parity=auto:deint=interlaced", (m_settings.SWDeintOutput == DeintOutput_FramePerField) ? "send_field" : "send_frame");
+            _snprintf_s(args_config, sizeof(args_config), "yadif=mode=%s:parity=auto:deint=interlaced", (m_settings.SWDeintOutput == DeintOutput_FramePerField) ? "send_field" : "send_frame");
           else if (m_settings.SWDeintMode == SWDeintMode_W3FDIF_Simple)
-            _snprintf_s(args, sizeof(args), "w3fdif=filter=simple:deint=interlaced");
+            _snprintf_s(args_config, sizeof(args_config), "w3fdif=filter=simple:deint=interlaced");
           else if (m_settings.SWDeintMode == SWDeintMode_W3FDIF_Complex)
-            _snprintf_s(args, sizeof(args), "w3fdif=filter=complex:deint=interlaced");
+            _snprintf_s(args_config, sizeof(args_config), "w3fdif=filter=complex:deint=interlaced");
           else
             ASSERT(0);
         }
         if (pFrame->width > m_scaleTarget && ShouldScale()) {
           char scale_str[128];
-          if (strlen(args))
-            strcat_s(args, ",");
+          if (strlen(args_config))
+            strcat_s(args_config, ",");
           _snprintf_s(scale_str, sizeof(scale_str), "scale=%d:-1:flags=neighbor", m_scaleTarget);
-          strcat_s(args, scale_str);
+          strcat_s(args_config, scale_str);
         }
         if (ShouldTonemap(pFrame)) {
-          if (strlen(args))
-            strcat_s(args, ",");
-          strcat_s(args, "zscale=t=linear:npl=250,tonemap=tonemap=clip:param=1.0:desat=0,zscale=t=bt709,format=yuv420p");
+          if (strlen(args_config))
+            strcat_s(args_config, ",");
+          strcat_s(args_config, "zscale=t=linear:npl=250,tonemap=tonemap=clip:param=1.0:desat=0,zscale=t=bt709,format=yuv420p");
         }
       }
 
-      if (!strlen(args)) {
+      if (!strlen(args_config)) {
         //FIXME: This should not exist, just make the filter work
-        _snprintf_s(args, sizeof(args), "scale=iw:-1:flags=neighbor");
+        _snprintf_s(args_config, sizeof(args_config), "scale=iw:-1:flags=neighbor");
       }
-      DbgLog((LOG_TRACE, 10, L"filter:%S", args));
-      if ((ret = avfilter_graph_parse_ptr(m_pFilterGraph, args, &inputs, &outputs, nullptr)) < 0) {
-        DbgLog((LOG_TRACE, 10, L"::Filter()(init) Parsing the graph failed with code %d", ret));
-        avfilter_graph_free(&m_pFilterGraph);
-        goto deliver;
-      }
+      DbgLog((LOG_TRACE, 10, L"filter:%S", args_config));
 
-      //init hardware
-      if (HWPostProc()) {
-        //TODO: Check if device will be freed in avfilter_graph_free
-        AVBufferRef *device;
-        ret = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_OPENCL, NULL, NULL, 0);
-        if (ret < 0)
-          goto deliver;
-        for (unsigned int i = 0; i < m_pFilterGraph->nb_filters; i++) {
-          m_pFilterGraph->filters[i]->hw_device_ctx = av_buffer_ref(device);
-          if (!m_pFilterGraph->filters[i]->hw_device_ctx) {
-            ret = AVERROR(ENOMEM);
-            goto deliver;
-          }
-        }
-        //TODO: Check if here is needed
-        //av_buffer_unref(&device);
-      }
-
-      if ((ret = avfilter_graph_config(m_pFilterGraph, nullptr)) < 0) {
-        DbgLog((LOG_TRACE, 10, L"::Filter()(init) Configuring the graph failed with code %d", ret));
-        avfilter_graph_free(&m_pFilterGraph);
-        goto deliver;
-      }
+      ProcThreadInitAll(this, pix_fmts, args_init, args_config, HWPostProc());
 
       DbgLog((LOG_TRACE, 10, L":Filter()(init) avfilter Initialization complete"));
     }
 
-    GetSystemTime(&t2);
-    DbgLog((LOG_TRACE, 10, L"After init: %u ms", ((t2.wMinute - t1.wMinute) * 60 + t2.wSecond - t1.wSecond) * 1000 + t2.wMilliseconds - t1.wMilliseconds));
-
-    if (!m_pFilterGraph)
+    if (!m_procThread[0].Inited)
       goto deliver;
 
     if (pFrame->direct) {
@@ -474,7 +627,7 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame) {
     }
 
     AVFrame *in_frame = nullptr;
-    BOOL refcountedFrame = (m_Decoder.HasThreadSafeBuffers() == S_OK);
+    //BOOL refcountedFrame = (m_Decoder.HasThreadSafeBuffers() == S_OK);
     // When flushing, we feed a NULL frame
     if (!bFlush) {
       in_frame = av_frame_alloc();
@@ -493,7 +646,7 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame) {
       in_frame->sample_aspect_ratio = pFrame->aspect_ratio;
       fillExtProperties(in_frame, pFrame);
 
-      if (refcountedFrame) {
+      /*if (refcountedFrame) {
         AVBufferRef *pFrameBuf = av_buffer_create(nullptr, 0, lav_free_lavframe, pFrame, 0);
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get((AVPixelFormat)in_frame->format);
         int planes = (in_frame->format == AV_PIX_FMT_NV12) ? 2 : desc->nb_components;
@@ -507,7 +660,7 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame) {
         }
         //FIXME: I don't think this unref is needed here
         //av_buffer_unref(&pFrameBuf);
-      }
+      }*/
 
       m_FilterPrevFrame = *pFrame;
       memset(m_FilterPrevFrame.data, 0, sizeof(m_FilterPrevFrame.data));
@@ -518,79 +671,49 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame) {
       *pFrame = m_FilterPrevFrame;
     }
 
-    GetSystemTime(&t2);
-    DbgLog((LOG_TRACE, 10, L"Before write frame: %u ms", ((t2.wMinute - t1.wMinute) * 60 + t2.wSecond - t1.wSecond) * 1000 + t2.wMilliseconds - t1.wMilliseconds));
-    if ((ret = av_buffersrc_write_frame(m_pFilterBufferSrc, in_frame)) < 0) {
-      av_frame_free(&in_frame);
-      goto deliver;
+    FrameInfo *info = (FrameInfo *)CoTaskMemAlloc(sizeof(FrameInfo));
+    if (!info)
+        goto deliver;
+    memset(info, 0, sizeof(FrameInfo));
+    BOOL bFramePerField = (m_settings.SWDeintMode == SWDeintMode_YADIF && m_settings.SWDeintOutput == DeintOutput_FramePerField) || m_settings.SWDeintMode == SWDeintMode_W3FDIF_Simple || m_settings.SWDeintMode == SWDeintMode_W3FDIF_Complex;
+    info->in_frame = in_frame;
+    info->rtDuration = pFrame->rtStop - pFrame->rtStart;
+    if (bFramePerField) {
+      info->rtDuration >>= 1;
+
+      if (pFrame->avgFrameDuration != AV_NOPTS_VALUE)
+        info->avgFrameDuration = pFrame->avgFrameDuration / 2;
+      else
+        info->avgFrameDuration = AV_NOPTS_VALUE;
     }
+    FeedFilter(info);
 
-    BOOL bFramePerField = (m_settings.SWDeintMode == SWDeintMode_YADIF && m_settings.SWDeintOutput == DeintOutput_FramePerField)
-                        || m_settings.SWDeintMode == SWDeintMode_W3FDIF_Simple || m_settings.SWDeintMode == SWDeintMode_W3FDIF_Complex;
-
-    AVFrame *out_frame = av_frame_alloc();
-    HRESULT hrDeliver = S_OK;
-    GetSystemTime(&t2);
-    DbgLog((LOG_TRACE, 10, L"Before get frame: %u ms", ((t2.wMinute - t1.wMinute) * 60 + t2.wSecond - t1.wSecond) * 1000 + t2.wMilliseconds - t1.wMilliseconds));
-    while (SUCCEEDED(hrDeliver) && (av_buffersink_get_frame(m_pFilterBufferSink, out_frame) >= 0)) {
-      LAVFrame *outFrame = nullptr;
-      AllocateFrame(&outFrame);
-
-      REFERENCE_TIME rtDuration = pFrame->rtStop - pFrame->rtStart;
-      if (bFramePerField)
-        rtDuration >>= 1;
-
-      const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get((AVPixelFormat)out_frame->format);
-      // Copy most settings over
-      outFrame->format       = ConvertFormat((AVPixelFormat)out_frame->format);
-      outFrame->bpp          = av_get_bits_per_pixel(desc);
-      fillDXVAExtFormat(outFrame->ext_format, out_frame->color_range - 1, out_frame->color_primaries, out_frame->colorspace, out_frame->color_trc, out_frame->chroma_location, false);
-      if (outFrame->ext_format.VideoTransferFunction == DXVA2_VideoTransFunc_709) {
-        outFrame->ext_format.VideoPrimaries = DXVA2_VideoPrimaries_BT709;
-        outFrame->ext_format.VideoTransferMatrix = DXVA2_VideoTransferMatrix_BT709;
-      }
-      outFrame->avgFrameDuration = pFrame->avgFrameDuration;
-      outFrame->flags        = pFrame->flags;
-
-      outFrame->width        = out_frame->width;
-      outFrame->height       = out_frame->height;
-      outFrame->aspect_ratio = out_frame->sample_aspect_ratio;
-      outFrame->tff          = out_frame->top_field_first;
-
-      REFERENCE_TIME pts     = av_rescale(out_frame->pts, m_pFilterBufferSink->inputs[0]->time_base.num * 10000000LL, m_pFilterBufferSink->inputs[0]->time_base.den);
-      outFrame->rtStart      = pts;
-      outFrame->rtStop       = pts + rtDuration;
-
-      if (bFramePerField) {
-        if (outFrame->avgFrameDuration != AV_NOPTS_VALUE)
-          outFrame->avgFrameDuration /= 2;
-      }
-
-      for (int i = 0; i < 4; i++) {
-        outFrame->data[i] = out_frame->data[i];
-        outFrame->stride[i] = out_frame->linesize[i];
-      }
-
-      outFrame->destruct = avfilter_free_lav_buffer;
-      outFrame->priv_data = av_frame_alloc();
-      av_frame_move_ref((AVFrame *)outFrame->priv_data, out_frame);
-
-      GetSystemTime(&t2);
-      DbgLog((LOG_TRACE, 10, L"Before deliver: %u ms", ((t2.wMinute - t1.wMinute) * 60 + t2.wSecond - t1.wSecond) * 1000 + t2.wMilliseconds - t1.wMilliseconds));
-      hrDeliver = DeliverToRenderer(outFrame);
+    if (Q.empty()) {
+        goto no_result;
     }
+    ProcThread* t = Q.front();
+    while(t->HasResult()) {
+      FrameInfo *out = t->GetResult();
+      if(out) {
+        DeliverFrame(out);
+      }
+      Q.pop();
+      t->running = FALSE;
+      if (Q.empty()) {
+        break;
+      }
+      t = Q.front();
+    }
+    /*
     if (!refcountedFrame)
       ReleaseFrame(&pFrame);
-    av_frame_free(&in_frame);
-    av_frame_free(&out_frame);
+      */
 
+ no_result:
     // We EOF'ed the graph, need to close it
     if (bFlush) {
-      if (m_pFilterGraph) {
-        avfilter_graph_free(&m_pFilterGraph);
-        m_pFilterBufferSrc = nullptr;
-        m_pFilterBufferSink = nullptr;
-      }
+      //delete filters in ProcThread
+      ProcThreadDeInitAll();
     }
 
     return S_OK;
