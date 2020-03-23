@@ -40,7 +40,7 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
   echo "Warning: Git not available or not a git repo. Using dummy values for hash and version number."
 else
   # Get information about the current version
-  describe=$(git describe --long `git log --grep="\[MPC-HC\] Use our own ffmpeg clone repository\." --pretty=%H`~1)
+  describe=$(git describe --long `git log --grep="\[MPC-HC\] Use our own ffmpeg clone repository\." --pretty=%H|head -1`~1)
   echo "Describe:  $describe"
 
   # Get the abbreviated hash of the current changeset
