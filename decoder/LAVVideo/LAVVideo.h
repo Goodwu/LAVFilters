@@ -53,6 +53,11 @@ extern "C" {
 #define DEBUG_PIXELCONV_TIMINGS 0
 
 #define FILTER_PROC_MULTI_THREAD
+#ifdef FILTER_PROC_MULTI_THREAD
+#define FILTER_PROC_THREADS 1
+#else
+#define FILTER_PROC_THREADS 1
+#endif
 #define FRAMES_IN_THREAD 16
 
 typedef struct {
@@ -97,17 +102,14 @@ class ProcThread {
       return 0;
   }
   int WaitDeInitDone() {
-      //wait for task complete
-      //DbgLog((LOG_TRACE, 10, L"[%d]Lock in deinit", m_iIdx));
-
       running = TRUE;
 
       Inited = FALSE;
       m_bRun = FALSE;
       {
-      std::unique_lock<std::mutex> lck(kickoff);
-      DbgLog((LOG_TRACE, 10, L"[%d]Kickoff notify in deinit", m_iIdx));
-      kickoff_cv.notify_all();
+        std::unique_lock<std::mutex> lck(kickoff);
+        DbgLog((LOG_TRACE, 10, L"[%d]Kickoff notify in deinit", m_iIdx));
+        kickoff_cv.notify_all();
       }
       running = FALSE;
       DbgLog((LOG_TRACE, 10, L"[%d]Start join", m_iIdx));
@@ -415,11 +417,6 @@ private:
  
   std::mutex deliver;
 
-#ifdef FILTER_PROC_MULTI_THREAD
-#define FILTER_PROC_THREADS 4
-#else
-#define FILTER_PROC_THREADS 1
-#endif
   ProcThread m_procThread[FILTER_PROC_THREADS];
   void ProcThreadDeInitAll() {
     for (int i = 0; i<FILTER_PROC_THREADS; i++) {

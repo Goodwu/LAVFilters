@@ -281,7 +281,8 @@ void ProcThread::Run()
   while (m_bRun) {
     DbgLog((LOG_TRACE, 10, L"[%d]Kickoff wait in Run", m_iIdx));
     std::unique_lock<std::mutex> lck(kickoff);
-    kickoff_cv.wait(lck);
+    if (m_pFrameInfo == NULL || HasResult())
+      kickoff_cv.wait(lck);
     DbgLog((LOG_TRACE, 10, L"[%d]Kickoff wait done in Run", m_iIdx));
     if (!m_bRun)
       break;
@@ -427,7 +428,7 @@ int ProcThread::Init(int i, CLAVVideo* pClav, AVPixelFormat* pix_fmts, char* str
 
 int CLAVVideo::FeedFilter(FrameInfo *in) {
   //Get a idle thread
-  for (int j=0; j < 5;j++) {
+  for (int j=0; j < 50;j++) {
     for (int i=0; i < FILTER_PROC_THREADS; i++) {
       if (m_procThread[i].Get()) {
         DbgLog((LOG_TRACE, 10, L"[%d]Got thread", i));
@@ -502,7 +503,8 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame)
   if (pFrame->ext_format.VideoTransferFunction == 15) {
     pFrame->format = LAVPixFmt_P016;
   }
-  //av_log_set_callback(&lavv_log_callback);
+  DbgLog((LOG_TRACE, 10, L"Filter called"));
+  av_log_set_callback(&lavv_log_callback);
 
   SYSTEMTIME t1, t2;
   GetSystemTime(&t1);
@@ -686,7 +688,9 @@ HRESULT CLAVVideo::Filter(LAVFrame *pFrame)
       else
         info->avgFrameDuration = AV_NOPTS_VALUE;
     }
+    DbgLog((LOG_TRACE, 10, L"Line:%d", __LINE__));
     FeedFilter(info);
+    DbgLog((LOG_TRACE, 10, L"Line:%d", __LINE__));
 
     if (Q.empty()) {
         goto no_result;
